@@ -26,9 +26,9 @@ def classify_gesture(landmarks):
     if thumb_tip.x < thumb_ip.x:  # Extended thumb (flipped frame)
         count_extended += 1
 
-    if count_extended >= 4:
+    if count_extended > 4:
         return "Open Palm"
-    elif count_extended <= 1:
+    elif count_extended < 1:
         return "Fist"
     else:
         return "Unclear Gesture"
