@@ -1,6 +1,5 @@
 import cv2
 import mediapipe as mp
-import numpy as np
 
 # MediaPipe setup
 mp_hands = mp.solutions.hands
@@ -8,30 +7,39 @@ mp_drawing = mp.solutions.drawing_utils
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
                        min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
-# Simple gesture logic: Open palm vs. fist
-def classify_gesture(landmarks):
-    tip_ids = [4, 8, 12, 16, 20]  # Thumb & Finger tips
-    count_extended = 0
+def classify_gesture(landmarks, hand_label):
+    tip_ids = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
+    fingers_extended = []
 
+    # Thumb: handedness-aware horizontal check (stable for webcam use)
+    thumb_tip = landmarks.landmark[tip_ids[0]]
+    thumb_ip  = landmarks.landmark[tip_ids[0] - 1]
+    if hand_label == "Right":
+        thumb_ext = thumb_tip.x < thumb_ip.x
+    else:  # Left hand
+        thumb_ext = thumb_tip.x > thumb_ip.x
+    fingers_extended.append(thumb_ext)
+
+    # Fingers (Index → Pinky): tip above PIP => extended
     for tip_id in tip_ids[1:]:
         tip = landmarks.landmark[tip_id]
-        pip = landmarks.landmark[tip_id - 2]  # Corresponding PIP joint
+        pip = landmarks.landmark[tip_id - 2]
+        fingers_extended.append(tip.y < pip.y)
 
-        if tip.y < pip.y:  # Finger is extended
-            count_extended += 1
-
-    # Thumb logic (optional, simplified)
-    thumb_tip = landmarks.landmark[4]
-    thumb_ip = landmarks.landmark[3]
-    if thumb_tip.x < thumb_ip.x:  # Extended thumb (flipped frame)
-        count_extended += 1
-
-    if count_extended > 4:
+    # Patterns
+    if all(fingers_extended):
         return "Open Palm"
-    elif count_extended < 1:
+    if not any(fingers_extended):
         return "Fist"
-    else:
-        return "Unclear Gesture"
+    if fingers_extended[1] and not any(fingers_extended[i] for i in [0, 2, 3, 4]):
+        return "Point"
+    if fingers_extended[1] and fingers_extended[2] and not any(fingers_extended[i] for i in [0, 3, 4]):
+        return "Peace"
+    if fingers_extended[0] and not any(fingers_extended[1:]):
+        return "Thumbs Up"
+    return "Unclear Gesture"
+
+
 
 # Webcam feed
 cap = cv2.VideoCapture(0)
@@ -45,10 +53,13 @@ while cap.isOpened():
     results = hands.process(rgb)
 
     gesture = "No Hand"
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            gesture = classify_gesture(hand_landmarks)
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            label = handedness.classification[0].label  # 'Left' or 'Right'
+            gesture = classify_gesture(hand_landmarks, label)
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+
 
     cv2.putText(frame, f'Gesture: {gesture}', (30, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
