@@ -1,112 +1,88 @@
 import cv2
 import mediapipe as mp
 from pyniryo import NiryoRobot
-import numpy as np
 import time
-import math
 
-# ===== CONFIGURATION =====
+# ========== CONFIGURATION ==========
 ROBOT_IP_ADDRESS = "192.168.8.146"
-CONTROL_INTERVAL = 0.05         # seconds between updates
-VELOCITY_SCALE = 0.002          # pixel → meters
-MAX_DELTA = 0.01                # max movement per axis per update (meters)
-DEAD_ZONE_RADIUS = 30           # pixels
-FIXED_ORIENTATION = [0.0, 1.57, 0.0]  # roll, pitch, yaw
-# ==========================
+
+# --- Workspace Settings ---
+ROBOT_MIN_X = 0.20 # Forward/Backward
+ROBOT_MAX_X = 0.35
+ROBOT_MIN_Y = -0.15 # Left/Right
+ROBOT_MAX_Y = 0.15
+ROBOT_Z_POSITION = 0.25 
+
+# --- Hand Tracking Settings ---
+HAND_TRACKING_MIN_X = 0.2 # Left/Right on screen
+HAND_TRACKING_MAX_X = 0.8
+HAND_TRACKING_MIN_Y = 0.2 # Up/Down on screen
+HAND_TRACKING_MAX_Y = 0.8
+# ===================================
 
 # MediaPipe setup
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1,
-                       min_detection_confidence=0.7,
-                       min_tracking_confidence=0.7)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
+                       min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
-# Connect to robot
-print("Connecting to robot...")
-robot = NiryoRobot(ROBOT_IP_ADDRESS)
-robot.calibrate_auto()
-print("Robot ready.")
+def scale_value(value, in_min, in_max, out_min, out_max):
+    """Helper function to map a value from one range to another."""
+    return (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
-# Webcam
-cap = cv2.VideoCapture(0)
+def main():
+    cap = cv2.VideoCapture(0)
+    robot = None
 
-# Tracking state
-prev_wrist_px = None
-prev_time = time.time()
-
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
-
-        if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-            # Wrist landmark
-            wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
-            wrist_px = np.array([w * wrist.x, h * wrist.y])
-
-            # Time delta
-            curr_time = time.time()
-            dt = curr_time - prev_time
-            prev_time = curr_time
-
-            # Velocity calculation
-            if prev_wrist_px is not None and dt > 0:
-                delta_px = wrist_px - prev_wrist_px
-                speed_px = delta_px / dt
-
-                # Dead zone
-                if np.linalg.norm(speed_px) < DEAD_ZONE_RADIUS:
-                    speed_px = np.array([0.0, 0.0])
-
-                # Convert to robot-space velocity
-                dx = max(min(speed_px[0] * VELOCITY_SCALE, MAX_DELTA), -MAX_DELTA)
-                dy = max(min(-speed_px[1] * VELOCITY_SCALE, MAX_DELTA), -MAX_DELTA)  # invert Y
-
-                # Get current pose
-                pose = robot.get_pose()
-                current_position = np.array(pose[:3])  # x, y, z
-
-                # Update position
-                new_position = current_position + np.array([dx, dy, 0.0])
-
-                # Clamp workspace (optional)
-                new_position = np.clip(new_position, [0.1, -0.2, 0.05], [0.4, 0.2, 0.3])
-
-                # Build target pose
-                target_pose = new_position.tolist() + FIXED_ORIENTATION
-
-                # Send move command
-                try:
-                    robot.move_pose(target_pose)
-                except Exception as e:
-                    print("Move failed:", e)
-
-            prev_wrist_px = wrist_px
-
-        cv2.circle(frame, (w // 2, h // 2), DEAD_ZONE_RADIUS, (0, 255, 0), 2)
-        cv2.imshow("Wrist Velocity Control", frame)
-
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC
-            break
-
-        time.sleep(CONTROL_INTERVAL)
-
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
     try:
-        robot.stop_move()
-    except:
-        pass
-    robot.close_connection()
-    hands.close()
-    print("Disconnected.")
+        print("--- Connecting to robot ---")
+        robot = NiryoRobot(ROBOT_IP_ADDRESS)
+        print("Connected successfully.")
+        
+        start_pose = [0.25, 0.0, 0.2, 0.0, 1.57, 0.0]
+        robot.move_pose(start_pose)
+        print("Robot at start pose. Show your hand to begin tracking.")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb_frame)
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    
+                    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+                    
+                    # Hand's Up/Down (wrist.y) controls Robot's Forward/Backward (target_x)
+                    target_x = scale_value(wrist.y, HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y, ROBOT_MAX_X, ROBOT_MIN_X) # Flipped
+                    
+                    # Hand's Left/Right (wrist.x) controls Robot's Left/Right (target_y)
+                    target_y = scale_value(wrist.x, HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X, ROBOT_MIN_Y, ROBOT_MAX_Y)
+                    
+                    target_pose = [target_x, target_y, ROBOT_Z_POSITION, 0.0, 1.57, 0.0]
+                    robot.move_pose(target_pose)
+            
+            cv2.imshow("Hand Tracking Control", frame)
+            if cv2.waitKey(1) & 0xFF == 27:  # Esc key
+                break
+
+    except Exception as e:
+        print("An error occurred:", e)
+
+    finally:
+        print("--- Cleaning up ---")
+        if robot:
+            robot.go_to_sleep()
+            robot.close_connection()
+        cap.release()
+        cv2.destroyAllWindows()
+        hands.close()
+        print("Resources released.")
+
+if __name__ == "__main__":
+    main()
