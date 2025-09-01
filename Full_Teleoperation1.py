@@ -7,8 +7,6 @@ import threading
 
 # ========== CONFIGURATION ==========
 ROBOT_IP_ADDRESS = "192.168.8.146"
-
-# --- Your Tuned Values ---
 COMMAND_INTERVAL = 0.5
 SMOOTHING_FACTOR = 1.0
 
@@ -24,7 +22,7 @@ HAND_MIN_SIZE, HAND_MAX_SIZE = 0.10, 0.25
 # --- Readiness Test Config ---
 BOX_TOP_LEFT = (0.4, 0.3)
 BOX_BOTTOM_RIGHT = (0.6, 0.7)
-HOLD_DURATION = 3.0 # seconds
+HOLD_DURATION = 5.0 # seconds
 # ===================================
 
 # --- Global variables for threads ---
@@ -32,6 +30,13 @@ latest_target_pose = None
 latest_gesture = None
 pose_lock = threading.Lock()
 stop_threads = False
+
+# --- State Machine for Tutorial ---
+STATE_WAITING_FOR_HAND = 0
+STATE_TEST_MODE_SWITCH = 1
+STATE_TEST_GRIPPER_OPEN = 2
+STATE_TEST_GRIPPER_CLOSE = 3
+STATE_TELEOP_ACTIVE = 4
 
 # MediaPipe setup and helper functions
 mp_hands = mp.solutions.hands
@@ -49,24 +54,45 @@ def get_hand_size(hand_landmarks):
 
 def classify_gesture(hand_landmarks):
     lm = hand_landmarks.landmark
-    fingers_extended = (lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y and
-                        lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y < lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y and
-                        lm[mp_hands.HandLandmark.RING_FINGER_TIP].y < lm[mp_hands.HandLandmark.RING_FINGER_PIP].y and
-                        lm[mp_hands.HandLandmark.PINKY_TIP].y < lm[mp_hands.HandLandmark.PINKY_PIP].y)
-    return "Open Hand" if fingers_extended else "Closed Hand"
+    
+    is_pointing = (lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y and
+                   lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y > lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y and
+                   lm[mp_hands.HandLandmark.RING_FINGER_TIP].y > lm[mp_hands.HandLandmark.RING_FINGER_PIP].y and
+                   lm[mp_hands.HandLandmark.PINKY_TIP].y > lm[mp_hands.HandLandmark.PINKY_PIP].y)
+    if is_pointing:
+        return "Pointing"
+
+    is_open = (lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y and
+               lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y < lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y and
+               lm[mp_hands.HandLandmark.RING_FINGER_TIP].y < lm[mp_hands.HandLandmark.RING_FINGER_PIP].y and
+               lm[mp_hands.HandLandmark.PINKY_TIP].y < lm[mp_hands.HandLandmark.PINKY_PIP].y)
+    if is_open:
+        return "Open Hand"
+    
+    return "Closed Hand"
 
 def robot_control_thread(robot):
     global latest_target_pose, latest_gesture, stop_threads
+    
     smoothed_x, smoothed_y, smoothed_z = None, None, None
     last_sent_gesture = None
     
+    MODE_ARM_CONTROL = "ARM"
+    MODE_GRIPPER_CONTROL = "GRIPPER"
+    current_mode = MODE_ARM_CONTROL
+    last_toggle_time = 0
+
     while not stop_threads:
         with pose_lock:
             target_pose_raw = latest_target_pose
             current_gesture = latest_gesture
         
-        # --- Arm Movement Control ---
-        if target_pose_raw:
+        if current_gesture == "Pointing" and (time.time() - last_toggle_time > 1.5):
+            current_mode = MODE_GRIPPER_CONTROL if current_mode == MODE_ARM_CONTROL else MODE_ARM_CONTROL
+            print(f"Switched to {current_mode} CONTROL mode")
+            last_toggle_time = time.time()
+        
+        if current_mode == MODE_ARM_CONTROL and target_pose_raw:
             raw_x, raw_y, raw_z = target_pose_raw
             if smoothed_x is None:
                 smoothed_x, smoothed_y, smoothed_z = raw_x, raw_y, raw_z
@@ -79,17 +105,17 @@ def robot_control_thread(robot):
             except Exception as e:
                 print(f"Robot movement error: {e}")
 
-        # --- Gripper Control ---
-        if current_gesture and current_gesture != last_sent_gesture:
-            try:
-                if current_gesture == "Open Hand":
-                    robot.open_gripper(speed=500)
-                else: # Closed Hand
-                    robot.close_gripper(speed=500)
-                last_sent_gesture = current_gesture
-            except Exception as e:
-                print(f"Gripper command error: {e}")
-
+        elif current_mode == MODE_GRIPPER_CONTROL and current_gesture and current_gesture != last_sent_gesture:
+            if current_gesture in ["Open Hand", "Closed Hand"]:
+                try:
+                    if current_gesture == "Open Hand":
+                        robot.open_gripper(speed=500)
+                    else:
+                        robot.close_gripper(speed=500)
+                    last_sent_gesture = current_gesture
+                except Exception as e:
+                    print(f"Gripper command error: {e}")
+        
         time.sleep(COMMAND_INTERVAL)
 
 def main():
@@ -100,7 +126,8 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
     robot = None
-    teleop_started = False
+    control_thread = None
+    current_state = STATE_WAITING_FOR_HAND
     hand_in_box_start_time = None
     
     try:
@@ -125,10 +152,10 @@ def main():
             if hand_is_visible:
                 hand_landmarks = results.multi_hand_landmarks[0]
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-            if not teleop_started:
-                # --- Readiness Test Logic ---
-                instruction_text = "Place Hand in Box to Start"
+            
+            # --- Tutorial State Machine Logic ---
+            if current_state == STATE_WAITING_FOR_HAND:
+                instruction_text = "Place Hand in Box"
                 start_point = (int(BOX_TOP_LEFT[0] * frame_width), int(BOX_TOP_LEFT[1] * frame_height))
                 end_point = (int(BOX_BOTTOM_RIGHT[0] * frame_width), int(BOX_BOTTOM_RIGHT[1] * frame_height))
                 cv2.rectangle(frame, start_point, end_point, (255, 0, 0), 2)
@@ -136,23 +163,43 @@ def main():
                 if hand_is_visible:
                     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
                     if (BOX_TOP_LEFT[0] < wrist.x < BOX_BOTTOM_RIGHT[0]) and (BOX_TOP_LEFT[1] < wrist.y < BOX_BOTTOM_RIGHT[1]):
-                        if hand_in_box_start_time is None:
-                            hand_in_box_start_time = time.time()
+                        if hand_in_box_start_time is None: hand_in_box_start_time = time.time()
                         time_in_box = time.time() - hand_in_box_start_time
                         instruction_text = f"Hold Steady... {int(HOLD_DURATION - time_in_box)}s"
                         if time_in_box > HOLD_DURATION:
-                            print("Readiness test passed. Starting teleoperation.")
-                            start_pose = [0.30, 0.0, 0.3, 0.0, 1.57, 0.0]
-                            robot.move_pose(start_pose)
-                            control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
-                            control_thread.start()
-                            teleop_started = True
+                            print("Step 1 Complete: Moving to start pose.")
+                            robot.move_pose([0.30, 0.0, 0.3, 0.0, 1.57, 0.0])
+                            current_state = STATE_TEST_MODE_SWITCH
                     else:
                         hand_in_box_start_time = None
                 else:
                     hand_in_box_start_time = None
-            else:
-                # --- Teleoperation is Active ---
+
+            elif current_state == STATE_TEST_MODE_SWITCH:
+                instruction_text = "Raise Index Finger Mode Switch Test"
+                if hand_is_visible and classify_gesture(hand_landmarks) == "Pointing":
+                    print("Step 2 Complete: Mode switch tested.")
+                    current_state = STATE_TEST_GRIPPER_OPEN
+
+            elif current_state == STATE_TEST_GRIPPER_OPEN:
+                instruction_text = "OPEN HAND to Open Gripper"
+                if hand_is_visible and classify_gesture(hand_landmarks) == "Open Hand":
+                    robot.open_gripper(speed=500)
+                    print("Step 3 Complete: Gripper open tested.")
+                    current_state = STATE_TEST_GRIPPER_CLOSE
+            
+            elif current_state == STATE_TEST_GRIPPER_CLOSE:
+                instruction_text = "Great! Make a FIST to Close Gripper"
+                if hand_is_visible and classify_gesture(hand_landmarks) == "Closed Hand":
+                    robot.close_gripper(speed=500)
+                    print("Step 4 Complete: Gripper close tested.")
+                    time.sleep(1) # Pause to appreciate
+                    print("Tutorial Complete! Starting teleoperation.")
+                    control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
+                    control_thread.start()
+                    current_state = STATE_TELEOP_ACTIVE
+
+            elif current_state == STATE_TELEOP_ACTIVE:
                 instruction_text = "Teleoperation Active"
                 if hand_is_visible:
                     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
@@ -163,7 +210,6 @@ def main():
                     raw_y = scale_value(wrist.x, HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X, ROBOT_MIN_Y, ROBOT_MAX_Y)
                     raw_z = scale_value(wrist.y, HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y, ROBOT_MAX_Z, ROBOT_MIN_Z)
                     
-                    # Update shared variables for the control thread
                     with pose_lock:
                         latest_target_pose = [raw_x, raw_y, raw_z]
                         latest_gesture = gesture
@@ -178,7 +224,8 @@ def main():
     finally:
         print("--- Cleaning up ---")
         stop_threads = True
-        time.sleep(0.5)
+        if control_thread is not None:
+            control_thread.join(timeout=2.0)
         if robot:
             robot.move_pose([0.30, 0.0, 0.3, 0.0, 1.57, 0.0])
             robot.go_to_sleep()
