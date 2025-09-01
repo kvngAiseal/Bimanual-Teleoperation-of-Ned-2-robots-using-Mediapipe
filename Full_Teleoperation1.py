@@ -9,7 +9,7 @@ import threading
 ROBOT_IP_ADDRESS = "192.168.8.146"
 
 # --- Your Tuned Values ---
-COMMAND_INTERVAL = 1.5
+COMMAND_INTERVAL = 0.5
 SMOOTHING_FACTOR = 1.0
 
 # --- Workspace & Hand Tracking Values ---
