@@ -6,9 +6,8 @@ import math
 
 # ========== CONFIGURATION ==========
 ROBOT_IP_ADDRESS = "192.168.8.146"
-
-# --- Robot Command Rate (reasonable rate to prevent overwhelming) ---
-COMMAND_INTERVAL = 1.5  # 10 FPS - slower but more stable
+# --- Robot Command Rate (to prevent overwhelming the robot) ---
+COMMAND_INTERVAL = 1.5  # 20 FPS max command rate
 
 # --- Light Smoothing (much less aggressive than before) ---
 SMOOTHING_FACTOR = 1.0  # Very light smoothing to reduce jitter
@@ -29,18 +28,18 @@ HAND_TRACKING_MAX_Y = 0.8
 HAND_MIN_SIZE = 0.10 # Hand appears small (far)
 HAND_MAX_SIZE = 0.25 # Hand appears large (close)
 
-# --- Camera optimization (minimal changes) ---
+# --- Camera optimization  ---
 PROCESS_EVERY_N_FRAMES = 2  # Process every 2nd frame for camera smoothness
 # ===================================
 
-# MediaPipe setup - keep it simple like the original
+# MediaPipe setup 
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 hands = mp_hands.Hands(
     static_image_mode=False, 
     max_num_hands=1,
-    min_detection_confidence=0.7,  # Same as original
-    min_tracking_confidence=0.7    # Same as original
+    min_detection_confidence=0.7,  
+    min_tracking_confidence=0.7    
 )
 
 def scale_value(value, in_min, in_max, out_min, out_max):
@@ -53,6 +52,9 @@ def get_hand_size(hand_landmarks):
     mcp_middle = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
     return math.sqrt((wrist.x - mcp_middle.x)**2 + (wrist.y - mcp_middle.y)**2)
 
+def apply_deadband(new_val, old_val, threshold):
+    return old_val if abs(new_val - old_val) < threshold else new_val
+
 def main():
     # Camera setup with minimal optimization
     cap = cv2.VideoCapture(0)
@@ -62,20 +64,19 @@ def main():
     
     robot = None
     
-    # Simple smoothing variables and current position tracking
+    # Simple smoothing variables (like original but with light smoothing)
     smoothed_x, smoothed_y, smoothed_z = None, None, None
-    current_robot_pos = [0.25, 0.0, 0.2]  # Track current robot position
     last_command_time = 0
     frame_count = 0
 
     try:
         print("--- Connecting to robot ---")
         robot = NiryoRobot(ROBOT_IP_ADDRESS)
-        print("Connected successfully.")
+        robot.calibrate_auto()
+        print("Connected successfully.s")
         
         start_pose = [0.25, 0.0, 0.2, 0.0, 1.57, 0.0]
         robot.move_pose(start_pose)
-        current_robot_pos = start_pose[:3]  # Initialize tracking position
         print("Robot at start pose. Show your hand to begin tracking.")
 
         while cap.isOpened():
@@ -118,16 +119,8 @@ def main():
                         # Rate limiting (prevent overwhelming robot)
                         current_time = time.time()
                         if (current_time - last_command_time) > COMMAND_INTERVAL:
-                            # Use simple move_pose but with smaller steps for smoother movement
                             target_pose = [smoothed_x, smoothed_y, smoothed_z, 0.0, 1.57, 0.0]
-                            
-                            try:
-                                robot.move_pose(target_pose)
-                                current_robot_pos = [smoothed_x, smoothed_y, smoothed_z]
-                            except Exception as e:
-                                print(f"Robot movement error: {e}")
-                                # Don't break the loop, just continue
-                            
+                            robot.move_pose(target_pose)  # Direct call like original
                             last_command_time = current_time
             
             frame_count += 1
