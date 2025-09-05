@@ -7,6 +7,7 @@ import threading
 
 # ========== CONFIGURATION ==========
 ROBOT_IP_ADDRESS = "192.168.8.146"
+# Using your tuned values
 COMMAND_INTERVAL = 0.5
 SMOOTHING_FACTOR = 1.0
 
@@ -28,6 +29,7 @@ HOLD_DURATION = 5.0 # seconds
 # --- Global variables for threads ---
 latest_target_pose = None
 latest_gesture = None
+is_paused = False 
 pose_lock = threading.Lock()
 stop_threads = False
 
@@ -36,7 +38,8 @@ STATE_WAITING_FOR_HAND = 0
 STATE_TEST_MODE_SWITCH = 1
 STATE_TEST_GRIPPER_OPEN = 2
 STATE_TEST_GRIPPER_CLOSE = 3
-STATE_TELEOP_ACTIVE = 4
+STATE_TEST_PAUSE = 4 # New state for testing pause
+STATE_TELEOP_ACTIVE = 5
 
 # MediaPipe setup and helper functions
 mp_hands = mp.solutions.hands
@@ -55,6 +58,13 @@ def get_hand_size(hand_landmarks):
 def classify_gesture(hand_landmarks):
     lm = hand_landmarks.landmark
     
+    is_peace = (lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y and
+                lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y < lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y and
+                lm[mp_hands.HandLandmark.RING_FINGER_TIP].y > lm[mp_hands.HandLandmark.RING_FINGER_PIP].y and
+                lm[mp_hands.HandLandmark.PINKY_TIP].y > lm[mp_hands.HandLandmark.PINKY_PIP].y)
+    if is_peace:
+        return "Peace"
+
     is_pointing = (lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y and
                    lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y > lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y and
                    lm[mp_hands.HandLandmark.RING_FINGER_TIP].y > lm[mp_hands.HandLandmark.RING_FINGER_PIP].y and
@@ -72,7 +82,7 @@ def classify_gesture(hand_landmarks):
     return "Closed Hand"
 
 def robot_control_thread(robot):
-    global latest_target_pose, latest_gesture, stop_threads
+    global latest_target_pose, latest_gesture, is_paused, stop_threads
     
     smoothed_x, smoothed_y, smoothed_z = None, None, None
     last_sent_gesture = None
@@ -83,6 +93,10 @@ def robot_control_thread(robot):
     last_toggle_time = 0
 
     while not stop_threads:
+        if is_paused:
+            time.sleep(COMMAND_INTERVAL)
+            continue
+
         with pose_lock:
             target_pose_raw = latest_target_pose
             current_gesture = latest_gesture
@@ -119,7 +133,7 @@ def robot_control_thread(robot):
         time.sleep(COMMAND_INTERVAL)
 
 def main():
-    global latest_target_pose, latest_gesture, stop_threads
+    global latest_target_pose, latest_gesture, is_paused, stop_threads
     
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -129,6 +143,7 @@ def main():
     control_thread = None
     current_state = STATE_WAITING_FOR_HAND
     hand_in_box_start_time = None
+    last_pause_toggle_time = 0
     
     try:
         print("--- Connecting to robot ---")
@@ -155,11 +170,10 @@ def main():
             
             # --- Tutorial State Machine Logic ---
             if current_state == STATE_WAITING_FOR_HAND:
-                instruction_text = "Place Hand in Box"
+                instruction_text = "Place Hand in Box to Start"
                 start_point = (int(BOX_TOP_LEFT[0] * frame_width), int(BOX_TOP_LEFT[1] * frame_height))
                 end_point = (int(BOX_BOTTOM_RIGHT[0] * frame_width), int(BOX_BOTTOM_RIGHT[1] * frame_height))
                 cv2.rectangle(frame, start_point, end_point, (255, 0, 0), 2)
-                
                 if hand_is_visible:
                     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
                     if (BOX_TOP_LEFT[0] < wrist.x < BOX_BOTTOM_RIGHT[0]) and (BOX_TOP_LEFT[1] < wrist.y < BOX_BOTTOM_RIGHT[1]):
@@ -170,13 +184,11 @@ def main():
                             print("Step 1 Complete: Moving to start pose.")
                             robot.move_pose([0.30, 0.0, 0.3, 0.0, 1.57, 0.0])
                             current_state = STATE_TEST_MODE_SWITCH
-                    else:
-                        hand_in_box_start_time = None
-                else:
-                    hand_in_box_start_time = None
+                    else: hand_in_box_start_time = None
+                else: hand_in_box_start_time = None
 
             elif current_state == STATE_TEST_MODE_SWITCH:
-                instruction_text = "Raise Index Finger Mode Switch Test"
+                instruction_text = "Raise Index Finger to test Mode Switch"
                 if hand_is_visible and classify_gesture(hand_landmarks) == "Pointing":
                     print("Step 2 Complete: Mode switch tested.")
                     current_state = STATE_TEST_GRIPPER_OPEN
@@ -193,27 +205,43 @@ def main():
                 if hand_is_visible and classify_gesture(hand_landmarks) == "Closed Hand":
                     robot.close_gripper(speed=500)
                     print("Step 4 Complete: Gripper close tested.")
-                    time.sleep(1) # Pause to appreciate
+                    current_state = STATE_TEST_PAUSE
+
+            elif current_state == STATE_TEST_PAUSE:
+                instruction_text = "Finally, show a PEACE SIGN to test Pause"
+                if hand_is_visible and classify_gesture(hand_landmarks) == "Peace":
+                    print("Step 5 Complete: Pause tested.")
+                    time.sleep(1)
                     print("Tutorial Complete! Starting teleoperation.")
                     control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
                     control_thread.start()
                     current_state = STATE_TELEOP_ACTIVE
 
             elif current_state == STATE_TELEOP_ACTIVE:
-                instruction_text = "Teleoperation Active"
                 if hand_is_visible:
-                    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
-                    hand_size = get_hand_size(hand_landmarks)
                     gesture = classify_gesture(hand_landmarks)
                     
-                    raw_x = scale_value(hand_size, HAND_MIN_SIZE, HAND_MAX_SIZE, ROBOT_MAX_X, ROBOT_MIN_X) 
-                    raw_y = scale_value(wrist.x, HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X, ROBOT_MIN_Y, ROBOT_MAX_Y)
-                    raw_z = scale_value(wrist.y, HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y, ROBOT_MAX_Z, ROBOT_MIN_Z)
-                    
+                    if gesture == "Peace" and (time.time() - last_pause_toggle_time > 1.5):
+                        is_paused = not is_paused
+                        print(f"Teleoperation {'PAUSED' if is_paused else 'RESUMED'}")
+                        last_pause_toggle_time = time.time()
+
+                    if is_paused:
+                        instruction_text = "PAUSED (Show Peace Sign to Resume)"
+                    else:
+                        instruction_text = "Teleoperation Active"
+                        wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+                        hand_size = get_hand_size(hand_landmarks)
+                        raw_x = scale_value(hand_size, HAND_MIN_SIZE, HAND_MAX_SIZE, ROBOT_MAX_X, ROBOT_MIN_X) 
+                        raw_y = scale_value(wrist.x, HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X, ROBOT_MIN_Y, ROBOT_MAX_Y)
+                        raw_z = scale_value(wrist.y, HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y, ROBOT_MAX_Z, ROBOT_MIN_Z)
+                        with pose_lock:
+                            latest_target_pose = [raw_x, raw_y, raw_z]
+                            latest_gesture = gesture
+                else:
                     with pose_lock:
-                        latest_target_pose = [raw_x, raw_y, raw_z]
-                        latest_gesture = gesture
-            
+                        latest_gesture = "No Hand"
+
             cv2.putText(frame, instruction_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.imshow("Hand Tracking Control", frame)
             if cv2.waitKey(1) & 0xFF == 27: break
