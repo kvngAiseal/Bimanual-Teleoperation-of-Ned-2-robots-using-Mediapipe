@@ -7,7 +7,6 @@ import threading
 
 # ========== CONFIGURATION ==========
 ROBOT_IP_ADDRESS = "192.168.8.146"
-# Using your tuned values
 COMMAND_INTERVAL = 0.5
 SMOOTHING_FACTOR = 1.0
 
@@ -25,6 +24,15 @@ BOX_TOP_LEFT = (0.4, 0.3)
 BOX_BOTTOM_RIGHT = (0.6, 0.7)
 HOLD_DURATION = 5.0 # seconds
 GESTURE_HOLD_DURATION = 3.0 # seconds for pause, resume, and home
+
+# --- Menu Box Configuration ---
+MENU_HOLD_DURATION = 3.0 # seconds to hold hand in a menu box
+RESUME_BOX_TL = (0.1, 0.3) # Top-Left for Resume box (normalized)
+RESUME_BOX_BR = (0.4, 0.7) # Bottom-Right for Resume box (normalized)
+EXIT_BOX_TL = (0.6, 0.3)   # Top-Left for Exit box (normalized)
+EXIT_BOX_BR = (0.9, 0.7)   # Bottom-Right for Exit box (normalized)
+
+
 START_POSE = [0.30, 0.0, 0.3, 0.0, 1.57, 0.0]
 HOME_POSE = [0.14, 0.00, 0.20, 0.00, 0.75, 0.00]
 # ===================================
@@ -34,9 +42,9 @@ latest_target_pose = None
 latest_gesture = None
 is_paused = False 
 pose_lock = threading.Lock()
-stop_threads = False
+stop_threads = False # Flag to stop all threads
 
-# --- State Machine for Tutorial ---
+# --- State Machine ---
 STATE_WAITING_FOR_HAND = 0
 STATE_TEST_MODE_SWITCH = 1
 STATE_TEST_GRIPPER_OPEN = 2
@@ -45,6 +53,8 @@ STATE_TEST_HOME = 4
 STATE_TEST_PAUSE = 5
 STATE_TEST_RESUME = 6
 STATE_TELEOP_ACTIVE = 7
+STATE_CHOICE_MENU = 8 # New state for menu selection
+STATE_EXITING = 9 # State to gracefully exit
 
 # MediaPipe setup and helper functions
 mp_hands = mp.solutions.hands
@@ -154,6 +164,7 @@ def main():
     control_thread = None
     current_state = STATE_WAITING_FOR_HAND
     gesture_start_time = None
+    menu_selection_time = None # New timer for menu selections
     
     try:
         print("--- Connecting to robot ---")
@@ -173,7 +184,7 @@ def main():
             
             instruction_text = ""
             hand_is_visible = results.multi_hand_landmarks and results.multi_handedness
-            gesture = "No Hand"
+            gesture = "No Hand" # Default to No Hand
 
             if hand_is_visible:
                 hand_landmarks = results.multi_hand_landmarks[0]
@@ -181,121 +192,135 @@ def main():
                 hand_label = handedness.classification[0].label
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                 gesture = classify_gesture(hand_landmarks, hand_label)
+                wrist_normalized = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST] # For menu box detection
             
-            # --- Expanded Tutorial State Machine ---
-            if current_state < STATE_TELEOP_ACTIVE:
-                if current_state == STATE_WAITING_FOR_HAND:
-                    instruction_text = "Place Hand in Box to Start"
-                    start_point = (int(BOX_TOP_LEFT[0] * frame_width), int(BOX_TOP_LEFT[1] * frame_height))
-                    end_point = (int(BOX_BOTTOM_RIGHT[0] * frame_width), int(BOX_BOTTOM_RIGHT[1] * frame_height))
-                    cv2.rectangle(frame, start_point, end_point, (255, 0, 0), 2)
-                    if hand_is_visible:
-                        wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
-                        if (BOX_TOP_LEFT[0] < wrist.x < BOX_BOTTOM_RIGHT[0]) and (BOX_TOP_LEFT[1] < wrist.y < BOX_BOTTOM_RIGHT[1]):
-                            if gesture_start_time is None: gesture_start_time = time.time()
-                            time_held = time.time() - gesture_start_time
-                            instruction_text = f"Hold Steady... {int(HOLD_DURATION - time_held)}s"
-                            if time_held > HOLD_DURATION:
-                                print("Step 1 Complete: Moving to start pose.")
-                                robot.move_pose(START_POSE)
-                                current_state = STATE_TEST_MODE_SWITCH
-                                gesture_start_time = None
-                        else: gesture_start_time = None
+            # --- State Machine Logic ---
+            if current_state == STATE_WAITING_FOR_HAND:
+                instruction_text = "Place Hand in Box to Start"
+                start_point = (int(BOX_TOP_LEFT[0] * frame_width), int(BOX_TOP_LEFT[1] * frame_height))
+                end_point = (int(BOX_BOTTOM_RIGHT[0] * frame_width), int(BOX_BOTTOM_RIGHT[1] * frame_height))
+                cv2.rectangle(frame, start_point, end_point, (255, 0, 0), 2)
+                if hand_is_visible:
+                    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+                    if (BOX_TOP_LEFT[0] < wrist.x < BOX_BOTTOM_RIGHT[0]) and (BOX_TOP_LEFT[1] < wrist.y < BOX_BOTTOM_RIGHT[1]):
+                        if gesture_start_time is None: gesture_start_time = time.time()
+                        time_held = time.time() - gesture_start_time
+                        instruction_text = f"Hold Steady... {int(HOLD_DURATION - time_held)}s"
+                        if time_held > HOLD_DURATION:
+                            print("Step 1 Complete: Moving to start pose.")
+                            robot.move_pose(START_POSE)
+                            current_state = STATE_TEST_MODE_SWITCH
+                            gesture_start_time = None
                     else: gesture_start_time = None
+                else: gesture_start_time = None
 
-                elif current_state == STATE_TEST_MODE_SWITCH:
-                    instruction_text = "Raise Index Finger to test Mode Switch"
-                    if gesture == "Pointing":
-                        print("Step 2 Complete: Mode switch tested.")
-                        current_state = STATE_TEST_GRIPPER_OPEN
-                
-                elif current_state == STATE_TEST_GRIPPER_OPEN:
-                    instruction_text = "OPEN HAND to Open Gripper"
-                    if gesture == "Open Hand":
-                        robot.open_gripper(speed=500)
-                        print("Step 3 Complete: Gripper open tested.")
-                        current_state = STATE_TEST_GRIPPER_CLOSE
-                
-                elif current_state == STATE_TEST_GRIPPER_CLOSE:
-                    instruction_text = "Great! Make a FIST to Close Gripper"
-                    if gesture == "Closed Hand":
-                        robot.close_gripper(speed=500)
-                        print("Step 4 Complete: Gripper close tested.")
-                        current_state = STATE_TEST_HOME
-                
-                elif current_state == STATE_TEST_HOME:
-                    instruction_text = "Hold THUMBS UP to test Go Home"
-                    if gesture == "Thumbs Up":
-                        if gesture_start_time is None: gesture_start_time = time.time()
-                        time_held = time.time() - gesture_start_time
-                        instruction_text = f"Going Home in {int(GESTURE_HOLD_DURATION - time_held)}s"
-                        if time_held > GESTURE_HOLD_DURATION:
-                            robot.move_pose(HOME_POSE)
-                            time.sleep(1) # Wait for move to finish
-                            robot.move_pose(START_POSE) # Return to start for next test
-                            print("Step 5 Complete: Go Home tested.")
-                            current_state = STATE_TEST_PAUSE
-                            gesture_start_time = None
-                    else:
+            elif current_state == STATE_TEST_MODE_SWITCH:
+                instruction_text = "Raise Index Finger to test Mode Switch"
+                if gesture == "Pointing":
+                    print("Step 2 Complete: Mode switch tested.")
+                    current_state = STATE_TEST_GRIPPER_OPEN
+            
+            elif current_state == STATE_TEST_GRIPPER_OPEN:
+                instruction_text = "OPEN HAND to Open Gripper"
+                if gesture == "Open Hand":
+                    robot.open_gripper(speed=500)
+                    print("Step 3 Complete: Gripper open tested.")
+                    current_state = STATE_TEST_GRIPPER_CLOSE
+            
+            elif current_state == STATE_TEST_GRIPPER_CLOSE:
+                instruction_text = "Great! Make a FIST to Close Gripper"
+                if gesture == "Closed Hand":
+                    robot.close_gripper(speed=500)
+                    print("Step 4 Complete: Gripper close tested.")
+                    current_state = STATE_TEST_HOME
+            
+            elif current_state == STATE_TEST_HOME:
+                instruction_text = "Hold THUMBS UP to test Go Home"
+                if gesture == "Thumbs Up":
+                    if gesture_start_time is None: gesture_start_time = time.time()
+                    time_held = time.time() - gesture_start_time
+                    instruction_text = f"Going Home in {int(GESTURE_HOLD_DURATION - time_held)}s"
+                    if time_held > GESTURE_HOLD_DURATION:
+                        robot.move_pose(HOME_POSE)
+                        time.sleep(1) # Wait for move to finish
+                        robot.move_pose(START_POSE) # Return to start for next test
+                        print("Step 5 Complete: Go Home tested.")
+                        current_state = STATE_TEST_PAUSE
                         gesture_start_time = None
-                        
-                elif current_state == STATE_TEST_PAUSE:
-                    instruction_text = "Hold PEACE SIGN to test Pause"
-                    if gesture == "Peace":
-                        if gesture_start_time is None: gesture_start_time = time.time()
-                        time_held = time.time() - gesture_start_time
-                        instruction_text = f"Pausing in {int(GESTURE_HOLD_DURATION - time_held)}s"
-                        if time_held > GESTURE_HOLD_DURATION:
-                            print("Step 6 Complete: Pause tested.")
-                            current_state = STATE_TEST_RESUME
-                            gesture_start_time = None
-                    else:
+                else:
+                    gesture_start_time = None
+                    
+            elif current_state == STATE_TEST_PAUSE:
+                instruction_text = "Hold PEACE SIGN to test Pause"
+                if gesture == "Peace":
+                    if gesture_start_time is None: gesture_start_time = time.time()
+                    time_held = time.time() - gesture_start_time
+                    instruction_text = f"Pausing in {int(GESTURE_HOLD_DURATION - time_held)}s"
+                    if time_held > GESTURE_HOLD_DURATION:
+                        print("Step 6 Complete: Pause tested.")
+                        current_state = STATE_TEST_RESUME
                         gesture_start_time = None
-                
-                elif current_state == STATE_TEST_RESUME:
-                    instruction_text = "Hold PEACE SIGN again to test Resume"
-                    if gesture == "Peace":
-                        if gesture_start_time is None: gesture_start_time = time.time()
-                        time_held = time.time() - gesture_start_time
-                        instruction_text = f"Resuming in {int(GESTURE_HOLD_DURATION - time_held)}s"
-                        if time_held > GESTURE_HOLD_DURATION:
-                            print("Step 7 Complete: Resume tested.")
-                            print("Tutorial Complete! Starting teleoperation.")
-                            control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
-                            control_thread.start()
-                            current_state = STATE_TELEOP_ACTIVE
-                            gesture_start_time = None
-                    else:
+                else:
+                    gesture_start_time = None
+            
+            elif current_state == STATE_TEST_RESUME:
+                instruction_text = "Hold PEACE SIGN again to test Resume"
+                if gesture == "Peace":
+                    if gesture_start_time is None: gesture_start_time = time.time()
+                    time_held = time.time() - gesture_start_time
+                    instruction_text = f"Resuming in {int(GESTURE_HOLD_DURATION - time_held)}s"
+                    if time_held > GESTURE_HOLD_DURATION:
+                        print("Step 7 Complete: Resume tested.")
+                        print("Tutorial Complete! Starting teleoperation.")
+                        control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
+                        control_thread.start()
+                        current_state = STATE_TELEOP_ACTIVE
                         gesture_start_time = None
+                else:
+                    gesture_start_time = None
 
             elif current_state == STATE_TELEOP_ACTIVE:
-                # --- Main Teleoperation Logic ---
                 is_holding_peace = (gesture == "Peace")
+                is_holding_thumbs_up = (gesture == "Thumbs Up")
                 
+                # Handle Peace Sign (Pause/Resume)
                 if is_holding_peace:
                     if gesture_start_time is None: gesture_start_time = time.time()
                     time_held = time.time() - gesture_start_time
                     
-                    # This block now has priority for setting the display text
-                    if is_paused:
-                        instruction_text = f"Resuming in {int(GESTURE_HOLD_DURATION - time_held)}s"
-                    else:
-                        instruction_text = f"Pausing in {int(GESTURE_HOLD_DURATION - time_held)}s"
+                    instruction_text = f"Resuming in {int(GESTURE_HOLD_DURATION - time_held)}s" if is_paused else f"Pausing in {int(GESTURE_HOLD_DURATION - time_held)}s"
                         
                     if time_held > GESTURE_HOLD_DURATION:
                         is_paused = not is_paused
                         print(f"Teleoperation {'PAUSED' if is_paused else 'RESUMED'}")
                         gesture_start_time = None 
                 else:
-                    gesture_start_time = None
-                    # Set the general status text only if not in the middle of a peace sign hold
+                    if gesture_start_time is not None and gesture != "Thumbs Up": # Reset if not holding peace or thumbs up
+                        gesture_start_time = None
+                
+                # Handle Thumbs Up (Go Home and Menu)
+                if is_holding_thumbs_up and not is_paused:
+                    if gesture_start_time is None: gesture_start_time = time.time()
+                    time_held = time.time() - gesture_start_time
+                    instruction_text = f"Parking Robot in {int(GESTURE_HOLD_DURATION - time_held)}s"
+                    if time_held > GESTURE_HOLD_DURATION:
+                        print("Thumbs Up held. Stopping teleoperation and moving to home pose.")
+                        stop_threads = True # Signal the control thread to stop
+                        if control_thread is not None:
+                            control_thread.join(timeout=2.0) # Wait for it to finish
+                        robot.move_pose(HOME_POSE) # Send final move command
+                        current_state = STATE_CHOICE_MENU # Transition to new menu state
+                        gesture_start_time = None
+                
+                # Default instruction text if no gesture is being held
+                if gesture_start_time is None:
                     if is_paused:
                         instruction_text = "PAUSED (Hold Peace to Resume)"
                     else:
                         instruction_text = "Teleoperation Active"
                 
-                # Update data for the control thread only if not paused
-                if not is_paused and hand_is_visible:
+                # Update data for the control thread only if not paused and not transitioning
+                if not is_paused and hand_is_visible and current_state == STATE_TELEOP_ACTIVE:
                     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
                     hand_size = get_hand_size(hand_landmarks)
                     raw_x = scale_value(hand_size, HAND_MIN_SIZE, HAND_MAX_SIZE, ROBOT_MAX_X, ROBOT_MIN_X) 
@@ -308,16 +333,77 @@ def main():
                     with pose_lock:
                         latest_gesture = "No Hand"
 
+            elif current_state == STATE_CHOICE_MENU:
+                instruction_text = "Choose an Option"
+                
+                # Draw "Resume Teleoperation" box
+                resume_box_start = (int(RESUME_BOX_TL[0] * frame_width), int(RESUME_BOX_TL[1] * frame_height))
+                resume_box_end = (int(RESUME_BOX_BR[0] * frame_width), int(RESUME_BOX_BR[1] * frame_height))
+                cv2.rectangle(frame, resume_box_start, resume_box_end, (0, 255, 255), 2) # Yellow box
+                cv2.putText(frame, "Resume Teleoperation", (resume_box_start[0] + 10, resume_box_start[1] + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Draw "Exit" box
+                exit_box_start = (int(EXIT_BOX_TL[0] * frame_width), int(EXIT_BOX_TL[1] * frame_height))
+                exit_box_end = (int(EXIT_BOX_BR[0] * frame_width), int(EXIT_BOX_BR[1] * frame_height))
+                cv2.rectangle(frame, exit_box_start, exit_box_end, (0, 0, 255), 2) # Red box
+                cv2.putText(frame, "Exit", (exit_box_start[0] + 10, exit_box_start[1] + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # Check hand position for selection
+                if hand_is_visible:
+                    hand_x_norm = wrist_normalized.x
+                    hand_y_norm = wrist_normalized.y
+
+                    # Check if hand is in Resume box
+                    if (RESUME_BOX_TL[0] < hand_x_norm < RESUME_BOX_BR[0]) and \
+                       (RESUME_BOX_TL[1] < hand_y_norm < RESUME_BOX_BR[1]):
+                        if menu_selection_time is None: menu_selection_time = time.time()
+                        time_in_box = time.time() - menu_selection_time
+                        instruction_text = f"Resuming in {int(MENU_HOLD_DURATION - time_in_box)}s"
+                        if time_in_box > MENU_HOLD_DURATION:
+                            print("Resuming teleoperation.")
+                            robot.move_pose(START_POSE) # Move back to start position
+                            is_paused = False # Ensure not paused
+                            stop_threads = False # Reset stop flag for new thread
+                            control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
+                            control_thread.start()
+                            current_state = STATE_TELEOP_ACTIVE
+                            menu_selection_time = None
+                    # Check if hand is in Exit box
+                    elif (EXIT_BOX_TL[0] < hand_x_norm < EXIT_BOX_BR[0]) and \
+                         (EXIT_BOX_TL[1] < hand_y_norm < EXIT_BOX_BR[1]):
+                        if menu_selection_time is None: menu_selection_time = time.time()
+                        time_in_box = time.time() - menu_selection_time
+                        instruction_text = f"Exiting in {int(MENU_HOLD_DURATION - time_in_box)}s"
+                        if time_in_box > MENU_HOLD_DURATION:
+                            print("Exiting program.")
+                            current_state = STATE_EXITING # Transition to exit state
+                            menu_selection_time = None
+                    else:
+                        menu_selection_time = None # Reset timer if hand not in any box
+                else:
+                    menu_selection_time = None # Reset timer if no hand visible
+            
+            elif current_state == STATE_EXITING:
+                # The cleanup in finally block will handle the actual exit
+                instruction_text = "Exiting program..."
+                stop_threads = True # Ensure cleanup handles thread
+                break # Exit the main loop to trigger finally block
+
             cv2.putText(frame, instruction_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.imshow("Hand Tracking Control", frame)
-            if cv2.waitKey(1) & 0xFF == 27: break
+            if cv2.waitKey(1) & 0xFF == 27: 
+                stop_threads = True # Ensure threads stop if ESC is pressed
+                break
+            
     except Exception as e:
         print(f"An error occurred: {e}")
 
     finally:
         print("--- Cleaning up ---")
-        stop_threads = True
-        if control_thread is not None:
+        stop_threads = True # Ensure threads are signalled to stop
+        if control_thread is not None and control_thread.is_alive():
             control_thread.join(timeout=2.0)
         if robot:
             robot.move_pose(HOME_POSE)
