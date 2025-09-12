@@ -11,13 +11,13 @@ COMMAND_INTERVAL = 0.5
 SMOOTHING_FACTOR = 1.0
 
 # --- Workspace & Hand Tracking Values ---
-ROBOT_MIN_X, ROBOT_MAX_X = 0.20, 0.35
+ROBOT_MIN_X, ROBOT_MAX_X = 0.10, 0.35
 ROBOT_MIN_Y, ROBOT_MAX_Y = -0.15, 0.15
 ROBOT_MIN_Z, ROBOT_MAX_Z = 0.15, 0.30 
 
 HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X = 0.2, 0.8
 HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y = 0.2, 0.8
-HAND_MIN_SIZE, HAND_MAX_SIZE = 0.10, 0.25
+HAND_MIN_SIZE, HAND_MAX_SIZE = 0.15, 0.25
 
 # --- Readiness Test & Gesture Config ---
 BOX_TOP_LEFT = (0.4, 0.3)
@@ -31,7 +31,6 @@ RESUME_BOX_TL = (0.1, 0.3) # Top-Left for Resume box (normalized)
 RESUME_BOX_BR = (0.4, 0.7) # Bottom-Right for Resume box (normalized)
 EXIT_BOX_TL = (0.6, 0.3)   # Top-Left for Exit box (normalized)
 EXIT_BOX_BR = (0.9, 0.7)   # Bottom-Right for Exit box (normalized)
-
 
 START_POSE = [0.30, 0.0, 0.3, 0.0, 1.57, 0.0]
 HOME_POSE = [0.14, 0.00, 0.20, 0.00, 0.75, 0.00]
@@ -96,6 +95,8 @@ def classify_gesture(landmarks, hand_label):
         return "Peace"
     if fingers_extended[1] and not any(fingers_extended[i] for i in [0, 2, 3, 4]):
         return "Pointing"
+    if fingers_extended[4] and not any(fingers_extended[i] for i in [0, 1, 2, 3]):
+        return "Pinky"  # NEW: Pinky finger gesture
     if all(fingers_extended):
         return "Open Hand"
     if not any(fingers_extended):
@@ -110,8 +111,12 @@ def robot_control_thread(robot):
     
     MODE_ARM_CONTROL = "ARM"
     MODE_GRIPPER_CONTROL = "GRIPPER"
+    MODE_GRIPPER_ROTATION = "ROTATION"  # NEW: Rotation mode
     current_mode = MODE_ARM_CONTROL
     last_toggle_time = 0
+    
+    # Store current pose for rotation mode
+    current_robot_pose = list(START_POSE)  # Initialize with start pose
 
     while not stop_threads:
         if is_paused:
@@ -122,11 +127,24 @@ def robot_control_thread(robot):
             target_pose_raw = latest_target_pose
             current_gesture = latest_gesture
         
+        # Mode switching logic
         if current_gesture == "Pointing" and (time.time() - last_toggle_time > 1.5):
-            current_mode = MODE_GRIPPER_CONTROL if current_mode == MODE_ARM_CONTROL else MODE_ARM_CONTROL
-            print(f"Switched to {current_mode} CONTROL mode")
+            if current_mode == MODE_ARM_CONTROL:
+                current_mode = MODE_GRIPPER_CONTROL
+            elif current_mode == MODE_GRIPPER_CONTROL:
+                current_mode = MODE_ARM_CONTROL
+            elif current_mode == MODE_GRIPPER_ROTATION:
+                current_mode = MODE_ARM_CONTROL
+            print(f"Switched to {current_mode} mode")
             last_toggle_time = time.time()
         
+        # NEW: Pinky switches to rotation mode from any mode
+        if current_gesture == "Pinky" and (time.time() - last_toggle_time > 1.5):
+            current_mode = MODE_GRIPPER_ROTATION
+            print(f"Switched to {current_mode} mode")
+            last_toggle_time = time.time()
+        
+        # ARM CONTROL MODE
         if current_mode == MODE_ARM_CONTROL and target_pose_raw:
             raw_x, raw_y, raw_z = target_pose_raw
             if smoothed_x is None:
@@ -135,11 +153,15 @@ def robot_control_thread(robot):
                 smoothed_x = (SMOOTHING_FACTOR * raw_x) + ((1 - SMOOTHING_FACTOR) * smoothed_x)
                 smoothed_y = (SMOOTHING_FACTOR * raw_y) + ((1 - SMOOTHING_FACTOR) * smoothed_y)
                 smoothed_z = (SMOOTHING_FACTOR * raw_z) + ((1 - SMOOTHING_FACTOR) * smoothed_z)
+            
+            # Update stored pose and send command
+            current_robot_pose = [smoothed_x, smoothed_y, smoothed_z, 0.0, 1.57, 0.0]
             try:
-                robot.move_pose([smoothed_x, smoothed_y, smoothed_z, 0.0, 1.57, 0.0])
+                robot.move_pose(current_robot_pose)
             except Exception as e:
                 print(f"Robot movement error: {e}")
 
+        # GRIPPER CONTROL MODE
         elif current_mode == MODE_GRIPPER_CONTROL and current_gesture and current_gesture != last_sent_gesture:
             if current_gesture in ["Open Hand", "Closed Hand"]:
                 try:
@@ -150,6 +172,25 @@ def robot_control_thread(robot):
                     last_sent_gesture = current_gesture
                 except Exception as e:
                     print(f"Gripper command error: {e}")
+        
+        # NEW: GRIPPER ROTATION MODE
+        elif current_mode == MODE_GRIPPER_ROTATION and target_pose_raw:
+            # Use hand X position to control gripper rotation
+            _, hand_x_norm, _ = target_pose_raw  # This comes from wrist.x
+            
+            # Convert hand X position to rotation angle (-π to π)
+            rotation_angle = scale_value(hand_x_norm, 
+                                       ROBOT_MIN_Y, ROBOT_MAX_Y,  # Using Y range for X input
+                                       -math.pi, math.pi)
+            
+            # Keep current X, Y, Z but update yaw rotation
+            rotation_pose = current_robot_pose.copy()
+            rotation_pose[5] = rotation_angle  # Update yaw (index 5)
+            
+            try:
+                robot.move_pose(rotation_pose)
+            except Exception as e:
+                print(f"Robot rotation error: {e}")
         
         time.sleep(COMMAND_INTERVAL)
 
@@ -317,13 +358,13 @@ def main():
                     if is_paused:
                         instruction_text = "PAUSED (Hold Peace to Resume)"
                     else:
-                        instruction_text = "Teleoperation Active"
+                        instruction_text = "Teleoperation Active (Point=Mode, Pinky=Rotate)"
                 
                 # Update data for the control thread only if not paused and not transitioning
                 if not is_paused and hand_is_visible and current_state == STATE_TELEOP_ACTIVE:
                     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
                     hand_size = get_hand_size(hand_landmarks)
-                    raw_x = scale_value(hand_size, HAND_MIN_SIZE, HAND_MAX_SIZE, ROBOT_MAX_X, ROBOT_MIN_X) 
+                    raw_x = scale_value(hand_size, HAND_MAX_SIZE, HAND_MIN_SIZE, ROBOT_MAX_X, ROBOT_MIN_X) 
                     raw_y = scale_value(wrist.x, HAND_TRACKING_MIN_X, HAND_TRACKING_MAX_X, ROBOT_MIN_Y, ROBOT_MAX_Y)
                     raw_z = scale_value(wrist.y, HAND_TRACKING_MIN_Y, HAND_TRACKING_MAX_Y, ROBOT_MAX_Z, ROBOT_MIN_Z)
                     with pose_lock:
