@@ -42,18 +42,21 @@ latest_gesture = None
 is_paused = False 
 pose_lock = threading.Lock()
 stop_threads = False # Flag to stop all threads
+current_robot_pose = START_POSE.copy()  # Track current pose globally
+pose_update_lock = threading.Lock()
 
 # --- State Machine ---
 STATE_WAITING_FOR_HAND = 0
 STATE_TEST_MODE_SWITCH = 1
 STATE_TEST_GRIPPER_OPEN = 2
 STATE_TEST_GRIPPER_CLOSE = 3
-STATE_TEST_HOME = 4
-STATE_TEST_PAUSE = 5
-STATE_TEST_RESUME = 6
-STATE_TELEOP_ACTIVE = 7
-STATE_CHOICE_MENU = 8 # New state for menu selection
-STATE_EXITING = 9 # State to gracefully exit
+STATE_TEST_GRIPPER_ROTATION = 4  # NEW: Test rotation
+STATE_TEST_HOME = 5
+STATE_TEST_PAUSE = 6
+STATE_TEST_RESUME = 7
+STATE_TELEOP_ACTIVE = 8
+STATE_CHOICE_MENU = 9 # New state for menu selection
+STATE_EXITING = 10 # State to gracefully exit
 
 # MediaPipe setup and helper functions
 mp_hands = mp.solutions.hands
@@ -95,8 +98,6 @@ def classify_gesture(landmarks, hand_label):
         return "Peace"
     if fingers_extended[1] and not any(fingers_extended[i] for i in [0, 2, 3, 4]):
         return "Pointing"
-    if fingers_extended[4] and not any(fingers_extended[i] for i in [0, 1, 2, 3]):
-        return "Pinky"  # NEW: Pinky finger gesture
     if all(fingers_extended):
         return "Open Hand"
     if not any(fingers_extended):
@@ -104,19 +105,16 @@ def classify_gesture(landmarks, hand_label):
     return "Unclear"
 
 def robot_control_thread(robot):
-    global latest_target_pose, latest_gesture, is_paused, stop_threads
+    global latest_target_pose, latest_gesture, is_paused, stop_threads, current_robot_pose
     
     smoothed_x, smoothed_y, smoothed_z = None, None, None
     last_sent_gesture = None
     
     MODE_ARM_CONTROL = "ARM"
-    MODE_GRIPPER_CONTROL = "GRIPPER"
-    MODE_GRIPPER_ROTATION = "ROTATION"  # NEW: Rotation mode
+    MODE_GRIPPER_CONTROL = "GRIPPER"  # Now handles open/close AND rotation
     current_mode = MODE_ARM_CONTROL
     last_toggle_time = 0
-    
-    # Store current pose for rotation mode
-    current_robot_pose = list(START_POSE)  # Initialize with start pose
+    last_rotation_angle = 0.0  # Track last rotation angle
 
     while not stop_threads:
         if is_paused:
@@ -127,24 +125,16 @@ def robot_control_thread(robot):
             target_pose_raw = latest_target_pose
             current_gesture = latest_gesture
         
-        # Mode switching logic
+        # Simple two-mode toggle with pointing gesture
         if current_gesture == "Pointing" and (time.time() - last_toggle_time > 1.5):
             if current_mode == MODE_ARM_CONTROL:
                 current_mode = MODE_GRIPPER_CONTROL
-            elif current_mode == MODE_GRIPPER_CONTROL:
-                current_mode = MODE_ARM_CONTROL
-            elif current_mode == MODE_GRIPPER_ROTATION:
+            else:
                 current_mode = MODE_ARM_CONTROL
             print(f"Switched to {current_mode} mode")
             last_toggle_time = time.time()
         
-        # NEW: Pinky switches to rotation mode from any mode
-        if current_gesture == "Pinky" and (time.time() - last_toggle_time > 1.5):
-            current_mode = MODE_GRIPPER_ROTATION
-            print(f"Switched to {current_mode} mode")
-            last_toggle_time = time.time()
-        
-        # ARM CONTROL MODE
+        # ARM CONTROL MODE - Position control
         if current_mode == MODE_ARM_CONTROL and target_pose_raw:
             raw_x, raw_y, raw_z = target_pose_raw
             if smoothed_x is None:
@@ -153,49 +143,56 @@ def robot_control_thread(robot):
                 smoothed_x = (SMOOTHING_FACTOR * raw_x) + ((1 - SMOOTHING_FACTOR) * smoothed_x)
                 smoothed_y = (SMOOTHING_FACTOR * raw_y) + ((1 - SMOOTHING_FACTOR) * smoothed_y)
                 smoothed_z = (SMOOTHING_FACTOR * raw_z) + ((1 - SMOOTHING_FACTOR) * smoothed_z)
-            
-            # Update stored pose and send command
-            current_robot_pose = [smoothed_x, smoothed_y, smoothed_z, 0.0, 1.57, 0.0]
             try:
-                robot.move_pose(current_robot_pose)
+                new_pose = [smoothed_x, smoothed_y, smoothed_z, 0.0, 1.57, last_rotation_angle]
+                robot.move_pose(new_pose)
+                with pose_update_lock:
+                    current_robot_pose = new_pose.copy()
             except Exception as e:
                 print(f"Robot movement error: {e}")
 
-        # GRIPPER CONTROL MODE
-        elif current_mode == MODE_GRIPPER_CONTROL and current_gesture and current_gesture != last_sent_gesture:
-            if current_gesture in ["Open Hand", "Closed Hand"]:
-                try:
-                    if current_gesture == "Open Hand":
-                        robot.open_gripper(speed=500)
-                    else:
-                        robot.close_gripper(speed=500)
-                    last_sent_gesture = current_gesture
-                except Exception as e:
-                    print(f"Gripper command error: {e}")
-        
-        # NEW: GRIPPER ROTATION MODE
-        elif current_mode == MODE_GRIPPER_ROTATION and target_pose_raw:
-            # Use hand X position to control gripper rotation
-            _, hand_x_norm, _ = target_pose_raw  # This comes from wrist.x
+        # GRIPPER CONTROL MODE - Open/Close + Rotation
+        elif current_mode == MODE_GRIPPER_CONTROL and target_pose_raw:
+            _, hand_y_norm, _ = target_pose_raw  # Get hand Y position (normalized)
             
-            # Convert hand X position to rotation angle (-π to π)
-            rotation_angle = scale_value(hand_x_norm, 
-                                       ROBOT_MIN_Y, ROBOT_MAX_Y,  # Using Y range for X input
-                                       -math.pi, math.pi)
+            # Handle gripper open/close based on gesture
+            if current_gesture and current_gesture != last_sent_gesture:
+                if current_gesture in ["Open Hand", "Closed Hand"]:
+                    try:
+                        if current_gesture == "Open Hand":
+                            robot.open_gripper(speed=500)
+                        else:
+                            robot.close_gripper(speed=500)
+                        last_sent_gesture = current_gesture
+                    except Exception as e:
+                        print(f"Gripper command error: {e}")
             
-            # Keep current X, Y, Z but update yaw rotation
-            rotation_pose = current_robot_pose.copy()
-            rotation_pose[5] = rotation_angle  # Update yaw (index 5)
-            
+            # Handle gripper rotation based on hand Y position (continuously)
             try:
+                # Convert hand Y position to rotation angle
+                # Using hand_y_norm which ranges from ROBOT_MIN_Y to ROBOT_MAX_Y
+                rotation_angle = scale_value(hand_y_norm, 
+                                           ROBOT_MIN_Y, ROBOT_MAX_Y,
+                                           -math.pi/2, math.pi/2)  # Limit rotation range
+                
+                # Use the tracked current pose and update only rotation
+                with pose_update_lock:
+                    rotation_pose = current_robot_pose.copy()
+                
+                rotation_pose[5] = rotation_angle  # Update yaw (index 5)
                 robot.move_pose(rotation_pose)
+                last_rotation_angle = rotation_angle  # Store for next arm movement
+                
+                with pose_update_lock:
+                    current_robot_pose[5] = rotation_angle
+                
             except Exception as e:
-                print(f"Robot rotation error: {e}")
+                print(f"Gripper rotation error: {e}")
         
         time.sleep(COMMAND_INTERVAL)
 
 def main():
-    global latest_target_pose, latest_gesture, is_paused, stop_threads
+    global latest_target_pose, latest_gesture, is_paused, stop_threads, current_robot_pose
     
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -250,6 +247,8 @@ def main():
                         if time_held > HOLD_DURATION:
                             print("Step 1 Complete: Moving to start pose.")
                             robot.move_pose(START_POSE)
+                            with pose_update_lock:
+                                current_robot_pose = START_POSE.copy()
                             current_state = STATE_TEST_MODE_SWITCH
                             gesture_start_time = None
                     else: gesture_start_time = None
@@ -269,11 +268,49 @@ def main():
                     current_state = STATE_TEST_GRIPPER_CLOSE
             
             elif current_state == STATE_TEST_GRIPPER_CLOSE:
-                instruction_text = "Great! Make a FIST to Close Gripper"
+                instruction_text = "Make a FIST to Close Gripper"
                 if gesture == "Closed Hand":
                     robot.close_gripper(speed=500)
                     print("Step 4 Complete: Gripper close tested.")
-                    current_state = STATE_TEST_HOME
+                    current_state = STATE_TEST_GRIPPER_ROTATION
+            
+            elif current_state == STATE_TEST_GRIPPER_ROTATION:
+                instruction_text = "Move hand LEFT and RIGHT to rotate gripper"
+                if hand_is_visible:
+                    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+                    # Calculate rotation angle for display
+                    test_rotation = scale_value(wrist.x, 0.2, 0.8, -90, 90)
+                    cv2.putText(frame, f"Rotation: {int(test_rotation)} degrees", (20, 120), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                    
+                    # Perform actual rotation during test
+                    try:
+                        rotation_angle_rad = math.radians(test_rotation)
+                        with pose_update_lock:
+                            test_pose = current_robot_pose.copy()
+                        test_pose[5] = rotation_angle_rad
+                        robot.move_pose(test_pose)
+                        with pose_update_lock:
+                            current_robot_pose[5] = rotation_angle_rad
+                    except Exception as e:
+                        print(f"Test rotation error: {e}")
+                    
+                    # Auto-advance after demonstrating rotation
+                    if gesture_start_time is None: gesture_start_time = time.time()
+                    time_in_rotation = time.time() - gesture_start_time
+                    if time_in_rotation > 5.0:  # 5 seconds of rotation demo
+                        print("Step 5 Complete: Gripper rotation tested.")
+                        # Reset rotation to neutral
+                        with pose_update_lock:
+                            reset_pose = current_robot_pose.copy()
+                        reset_pose[5] = 0.0
+                        robot.move_pose(reset_pose)
+                        with pose_update_lock:
+                            current_robot_pose[5] = 0.0
+                        current_state = STATE_TEST_HOME
+                        gesture_start_time = None
+                else:
+                    gesture_start_time = None
             
             elif current_state == STATE_TEST_HOME:
                 instruction_text = "Hold THUMBS UP to test Go Home"
@@ -283,9 +320,13 @@ def main():
                     instruction_text = f"Going Home in {int(GESTURE_HOLD_DURATION - time_held)}s"
                     if time_held > GESTURE_HOLD_DURATION:
                         robot.move_pose(HOME_POSE)
+                        with pose_update_lock:
+                            current_robot_pose = HOME_POSE.copy()
                         time.sleep(1) # Wait for move to finish
                         robot.move_pose(START_POSE) # Return to start for next test
-                        print("Step 5 Complete: Go Home tested.")
+                        with pose_update_lock:
+                            current_robot_pose = START_POSE.copy()
+                        print("Step 6 Complete: Go Home tested.")
                         current_state = STATE_TEST_PAUSE
                         gesture_start_time = None
                 else:
@@ -298,7 +339,7 @@ def main():
                     time_held = time.time() - gesture_start_time
                     instruction_text = f"Pausing in {int(GESTURE_HOLD_DURATION - time_held)}s"
                     if time_held > GESTURE_HOLD_DURATION:
-                        print("Step 6 Complete: Pause tested.")
+                        print("Step 7 Complete: Pause tested.")
                         current_state = STATE_TEST_RESUME
                         gesture_start_time = None
                 else:
@@ -311,7 +352,7 @@ def main():
                     time_held = time.time() - gesture_start_time
                     instruction_text = f"Resuming in {int(GESTURE_HOLD_DURATION - time_held)}s"
                     if time_held > GESTURE_HOLD_DURATION:
-                        print("Step 7 Complete: Resume tested.")
+                        print("Step 8 Complete: Resume tested.")
                         print("Tutorial Complete! Starting teleoperation.")
                         control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
                         control_thread.start()
@@ -350,6 +391,8 @@ def main():
                         if control_thread is not None:
                             control_thread.join(timeout=2.0) # Wait for it to finish
                         robot.move_pose(HOME_POSE) # Send final move command
+                        with pose_update_lock:
+                            current_robot_pose = HOME_POSE.copy()
                         current_state = STATE_CHOICE_MENU # Transition to new menu state
                         gesture_start_time = None
                 
@@ -358,7 +401,7 @@ def main():
                     if is_paused:
                         instruction_text = "PAUSED (Hold Peace to Resume)"
                     else:
-                        instruction_text = "Teleoperation Active (Point=Mode, Pinky=Rotate)"
+                        instruction_text = "Teleoperation Active (Point=Toggle Mode)"
                 
                 # Update data for the control thread only if not paused and not transitioning
                 if not is_paused and hand_is_visible and current_state == STATE_TELEOP_ACTIVE:
@@ -405,6 +448,8 @@ def main():
                         if time_in_box > MENU_HOLD_DURATION:
                             print("Resuming teleoperation.")
                             robot.move_pose(START_POSE) # Move back to start position
+                            with pose_update_lock:
+                                current_robot_pose = START_POSE.copy()
                             is_paused = False # Ensure not paused
                             stop_threads = False # Reset stop flag for new thread
                             control_thread = threading.Thread(target=robot_control_thread, args=(robot,), daemon=True)
